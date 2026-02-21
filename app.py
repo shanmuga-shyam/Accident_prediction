@@ -12,6 +12,7 @@ from sklearn.ensemble import RandomForestClassifier
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
+from src.feature_builder import build_feature_vector, compute_baseline_risk, build_normalized_vector
 from sklearn.model_selection import GridSearchCV
 from sklearn.calibration import CalibratedClassifierCV
 
@@ -222,6 +223,38 @@ def build_ui(df, features, results, pipelines, type_model, area_model):
                 prob = float(best_pipe.predict(input_df)[0])
 
             st.markdown(f"**Predicted accident probability:** {prob:.2%}")
+            # --- Weighted preprocessing vector & baseline risk ---
+            mapped_input = {
+                'weather': input_dict.get('Weather'),
+                'road_type': input_dict.get('Road_Type'),
+                'time_of_day': input_dict.get('Time_of_Day'),
+                'road_condition': input_dict.get('Road_Condition') if input_dict.get('Road_Condition') != 'Icy' else 'Ice',
+                'light_condition': input_dict.get('Light_Condition') if input_dict.get('Light_Condition') != 'Dark' else 'No Street Light',
+                'traffic_density': float(input_dict.get('Traffic_Density', 0.0)),
+                'speed_limit': float(input_dict.get('Speed_Limit', 20.0)),
+                'vehicles_nearby': float(input_dict.get('Vehicles_Nearby', 0.0)),
+                'driver_age': float(input_dict.get('Driver_Age', 40.0)),
+                'driving_experience': float(input_dict.get('Driving_Experience', 0.0)),
+                'alcohol': float(input_dict.get('Alcohol', 0.0)),
+            }
+            try:
+                vec = build_feature_vector(mapped_input)
+                baseline_risk = compute_baseline_risk(vec)
+                st.markdown(f"**Baseline (preprocessing) risk:** {baseline_risk:.2%}")
+            except Exception as e:
+                st.warning(f"Could not build weighted feature vector: {e}")
+                vec = None
+
+            # --- Optional weighted regressor prediction if available ---
+            weighted_model_path = os.path.join('models', 'accident_risk_model.joblib')
+            weighted_pred = None
+            if vec is not None and os.path.exists(weighted_model_path):
+                try:
+                    wmodel = joblib.load(weighted_model_path)
+                    weighted_pred = float(wmodel.predict([vec])[0])
+                    st.markdown(f"**Weighted-model predicted risk:** {weighted_pred:.2%}")
+                except Exception:
+                    weighted_pred = None
             # Predict Accident Type and Area regardless of probability if models exist
             if type_model is not None:
                 try:
@@ -278,6 +311,127 @@ def build_ui(df, features, results, pipelines, type_model, area_model):
                 axs[2].text(0.5,0.5,'No Area', ha='center')
             plt.tight_layout()
             st.pyplot(figd)
+
+            # --- Feature contributions (weighted and percent) ---
+            if vec is not None:
+                with contextlib.suppress(Exception):
+                    import pandas as _pd
+                    feature_names = ['weather','road_type','time_of_day','road_condition','light_condition','traffic','speed','vehicles','age','experience','alcohol']
+                    contrib_df = _pd.DataFrame({'feature': feature_names, 'contribution': vec})
+                    contrib_df = contrib_df.sort_values('contribution', ascending=False).reset_index(drop=True)
+
+                    # input-normalized contributions (before importance)
+                    with contextlib.suppress(Exception):
+                        norm_vec = build_normalized_vector(mapped_input)
+                        input_df = _pd.DataFrame({'feature': feature_names, 'value': norm_vec})
+                        input_df = input_df.sort_values('value', ascending=False).reset_index(drop=True)
+                        st.subheader('Feature contributions (input — normalized 0-1)')
+                        st.bar_chart(input_df.set_index('feature')['value'])
+
+                        total_in = float(input_df['value'].sum())
+                        input_df['percent'] = input_df['value'] / total_in if total_in > 0 else 0.0
+                        st.subheader('Feature contributions (input percent of total)')
+                        st.bar_chart(input_df.set_index('feature')['percent'])
+
+                        # pie chart for input percent
+                        with contextlib.suppress(Exception):
+                            fig_in, ax_in = plt.subplots(figsize=(5, 5))
+                            ax_in.pie(input_df['percent'], labels=input_df['feature'], autopct='%1.1f%%', startangle=140)
+                            ax_in.axis('equal')
+                            st.pyplot(fig_in)
+                    st.subheader('Feature contributions (weighted)')
+                    st.bar_chart(contrib_df.set_index('feature'))
+
+                    # compute percent contribution of each feature
+                    total = float(contrib_df['contribution'].sum())
+                    if total > 0:
+                        contrib_df['percent'] = contrib_df['contribution'] / total
+                    else:
+                        contrib_df['percent'] = 0.0
+
+                    st.subheader('Feature contributions (percent of total)')
+                    st.bar_chart(contrib_df.set_index('feature')['percent'])
+
+                    # pie chart for percent distribution
+                    with contextlib.suppress(Exception):
+                        figp, axp = plt.subplots(figsize=(6, 6))
+                        axp.pie(contrib_df['percent'], labels=contrib_df['feature'], autopct='%1.1f%%', startangle=140)
+                        axp.axis('equal')
+                        st.pyplot(figp)
+                    # numeric percent table
+                    pct_df = contrib_df[['feature', 'percent']].copy()
+                    pct_df['percent'] = (pct_df['percent'] * 100).round(2)
+                    pct_df = pct_df.set_index('feature')
+                    st.table(pct_df)
+            # --- What-if: reduce numeric inputs toward safer values and plot risk change ---
+            if vec is not None:
+                st.subheader('What-if: reduce numeric inputs toward safer values')
+                steps = 20
+                chart_data = {}
+                numeric_ranges = {
+                    'Traffic_Density': (0.0, 10.0),
+                    'Speed_Limit': (20.0, 120.0),
+                    'Vehicles_Nearby': (0.0, 20.0),
+                    'Driver_Age': (18.0, 75.0),
+                    'Driving_Experience': (0.0, 40.0),
+                    'Alcohol': (0.0, 1.0),
+                }
+
+                def _predict_for_variation(var_key, values_list):
+                    res = []
+                    for v in values_list:
+                        d = dict(input_dict)
+                        d[var_key] = v
+                        # map and build vector
+                        mapped = {
+                            'weather': d.get('Weather'),
+                            'road_type': d.get('Road_Type'),
+                            'time_of_day': d.get('Time_of_Day'),
+                            'road_condition': d.get('Road_Condition') if d.get('Road_Condition') != 'Icy' else 'Ice',
+                            'light_condition': d.get('Light_Condition') if d.get('Light_Condition') != 'Dark' else 'No Street Light',
+                            'traffic_density': float(d.get('Traffic_Density', 0.0)),
+                            'speed_limit': float(d.get('Speed_Limit', 20.0)),
+                            'vehicles_nearby': float(d.get('Vehicles_Nearby', 0.0)),
+                            'driver_age': float(d.get('Driver_Age', 40.0)),
+                            'driving_experience': float(d.get('Driving_Experience', 0.0)),
+                            'alcohol': float(d.get('Alcohol', 0.0)),
+                        }
+                        mapped_key = var_key
+                        # update the varied key in mapped structure
+                        if var_key == 'Traffic_Density':
+                            mapped['traffic_density'] = float(v)
+                        elif var_key == 'Speed_Limit':
+                            mapped['speed_limit'] = float(v)
+                        elif var_key == 'Vehicles_Nearby':
+                            mapped['vehicles_nearby'] = float(v)
+                        elif var_key == 'Driver_Age':
+                            mapped['driver_age'] = float(v)
+                        elif var_key == 'Driving_Experience':
+                            mapped['driving_experience'] = float(v)
+                        elif var_key == 'Alcohol':
+                            mapped['alcohol'] = float(v)
+
+                        try:
+                            vvec = build_feature_vector(mapped)
+                            if os.path.exists(weighted_model_path):
+                                try:
+                                    wmodel = joblib.load(weighted_model_path)
+                                    res.append(float(wmodel.predict([vvec])[0]))
+                                except Exception:
+                                    res.append(float(compute_baseline_risk(vvec)))
+                            else:
+                                res.append(float(compute_baseline_risk(vvec)))
+                        except Exception:
+                            res.append(None)
+                    return res
+
+                for var, (mn, mx) in numeric_ranges.items():
+                    cur = input_dict.get(var)
+                    values = [cur - (i / (steps - 1)) * (cur - mn) for i in range(steps)]
+                    chart_data[var] = _predict_for_variation(var, values)
+
+                st.line_chart(chart_data)
+                st.caption('Lower values represent moving toward safer settings; lines show predicted risk.')
 
     with col2:
         st.subheader('Model Comparison')
