@@ -13,6 +13,15 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
 from src.feature_builder import build_feature_vector, compute_baseline_risk, build_normalized_vector
+from src.assistant import (
+    forecast_risk,
+    predict_driver_behavior,
+    predict_severity,
+    generate_safety_recommendation,
+    predict_traffic,
+    estimate_response_time,
+    DriverProfile,
+)
 from sklearn.model_selection import GridSearchCV
 from sklearn.calibration import CalibratedClassifierCV
 
@@ -432,6 +441,7 @@ def build_ui(df, features, results, pipelines, type_model, area_model):
 
                 st.line_chart(chart_data)
                 st.caption('Lower values represent moving toward safer settings; lines show predicted risk.')
+                # advanced section moved below model volatility
 
     with col2:
         st.subheader('Model Comparison')
@@ -457,6 +467,95 @@ def build_ui(df, features, results, pipelines, type_model, area_model):
         ax2.barh(y_pos, stds_sorted, color=colors2)
         _extracted_from_build_ui_80(ax2, y_pos, names_sorted, 'Std Dev')
         st.pyplot(fig2)
+
+        # --- Advanced Forecasting & Prevention (moved below Model Volatility) ---
+        with st.expander('Advanced Forecast & Prevention'):
+            # Forecast next 1,3,6 hours
+            offsets = [1, 3, 6]
+            forecasts = []
+            for o in offsets:
+                try:
+                    frisk, flabel = forecast_risk(mapped_input, o)
+                except Exception:
+                    frisk, flabel = None, None
+                forecasts.append({"hours_ahead": o, "risk": frisk, "label": flabel})
+            fdf = pd.DataFrame(forecasts).set_index('hours_ahead')
+            st.subheader('Future risk forecast')
+            st.table(fdf)
+            st.line_chart(fdf['risk'])
+
+            # Traffic forecast over 24 hours
+            st.subheader('Traffic density forecast (24h)')
+            is_weekend = st.checkbox('Weekend', value=False)
+            hours = list(range(24))
+            traf = [predict_traffic(h, is_weekend) for h in hours]
+            st.line_chart(pd.DataFrame({'hour': hours, 'traffic': traf}).set_index('hour'))
+
+            # Severity prediction
+            st.subheader('Accident severity estimate')
+            if vec is not None:
+                severity_class, severity_probs = predict_severity(vec)
+                sp = pd.Series(severity_probs)
+                st.write('Predicted severity:', severity_class)
+                st.bar_chart(sp)
+
+            # Driver behavior prediction (simulate or input)
+            st.subheader('Driver behavior analysis')
+            simulate = st.checkbox('Simulate telemetry for behavior analysis', value=True)
+            if simulate:
+                # synthetic speed history around current speed limit
+                cur_speed = float(input_dict.get('Speed_Limit', 60))
+                import random
+                speed_hist = [max(0, random.gauss(cur_speed, 8)) for _ in range(30)]
+                braking = [1.0 if random.random() < 0.05 else random.random()*0.4 for _ in range(30)]
+                time_awake = st.slider('Time awake hours (simulate)', 0.0, 24.0, 2.0)
+            else:
+                # minimal inputs
+                speed_hist = [float(input_dict.get('Speed_Limit', 60)) for _ in range(30)]
+                braking = [0.0 for _ in range(30)]
+                time_awake = st.slider('Time awake hours', 0.0, 24.0, 2.0)
+            alerts = predict_driver_behavior(speed_hist, braking, time_awake)
+            st.write('Behavior alerts:', alerts)
+            # show speed & braking charts
+            st.line_chart(pd.DataFrame({'speed': speed_hist}))
+            st.bar_chart(pd.DataFrame({'brake': braking}))
+
+            # Safety recommendations
+            st.subheader('Preventive recommendations')
+            risk_for_reco = weighted_pred if weighted_pred is not None else baseline_risk if vec is not None else prob
+            try:
+                recs = generate_safety_recommendation(risk_for_reco, mapped_input)
+                for r in recs:
+                    st.write('- ', r)
+            except Exception:
+                st.write('No recommendations available')
+
+            # Emergency response estimate
+            st.subheader('Emergency response estimation')
+            eta, et_level = estimate_response_time(mapped_input.get('road_type', 'Urban'), float(input_dict.get('Traffic_Density', 0.0)), input_dict.get('Time_of_Day', 'Afternoon'))
+            st.metric('Estimated arrival (min)', f"{eta}")
+            st.write('Response risk level:', et_level)
+
+            # Driver profile management
+            st.subheader('Driver profile')
+            dp = DriverProfile()
+            driver_id = st.text_input('Driver ID', value='driver_1')
+            overspeed_count = alerts.get('scores', {}).get('overspeed_spikes', 0)
+            if st.button('Update driver profile'):
+                dp.update_profile(driver_id, {'risk_score': float(risk_for_reco or 0.0), 'time_of_day': input_dict.get('Time_of_Day'), 'overspeed_count': overspeed_count})
+                st.success('Profile updated')
+            rating = dp.get_driver_risk_rating(driver_id)
+            st.write('Driver long-term risk rating (0-100):', rating)
+            # show driver history if exists
+            try:
+                hist = dp.store.get(driver_id, {}).get('history', [])
+                if hist:
+                    hist_df = pd.DataFrame(hist)
+                    hist_df['ts'] = pd.to_datetime(hist_df['ts'])
+                    hist_df = hist_df.set_index('ts')
+                    st.line_chart(hist_df['risk'])
+            except Exception:
+                pass
 
 
 # TODO Rename this here and in `build_ui`
