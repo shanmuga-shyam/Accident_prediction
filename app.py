@@ -75,17 +75,149 @@ def generate_synthetic(n=2000, random_state=42):
     area = ['Urban','Suburban','Highway']
     df['Accident_Type'] = rng.choice(types, size=n)
     df['Area'] = rng.choice(area, size=n)
+    # synthetic damage label: derive from accident presence and conditions
+    def _damage_label(row):
+        if row['Accident'] == 0:
+            return 'None'
+        score = 0.0
+        score += min(1.0, row['Speed_Limit'] / 120.0)
+        score += 0.3 if row['Weather'] != 'Clear' else 0.0
+        score += 0.25 if row['Road_Condition'] != 'Dry' else 0.0
+        score += 0.4 if row['Alcohol'] > 0 else 0.0
+        score += 0.2 if row['Vehicles_Nearby'] > 5 else 0.0
+        if score < 0.6:
+            return 'Minor'
+        return 'Moderate' if score < 1.2 else 'Severe'
+
+    df['Damage'] = df.apply(_damage_label, axis=1)
     return df
 
 
 @st.cache_data
 def load_data():
-    csv_path = os.path.join('dataset','accidents.csv')
-    return (
-        pd.read_csv(csv_path)
-        if os.path.exists(csv_path)
-        else generate_synthetic()
-    )
+    ds_dir = 'dataset'
+    if excel_candidates := [
+        os.path.join(ds_dir, f)
+        for f in os.listdir(ds_dir)
+        if f.lower().endswith(('.xls', '.xlsx'))
+    ]:
+        with contextlib.suppress(Exception):
+            return pd.read_excel(excel_candidates[0])
+    csv_path = os.path.join(ds_dir, 'accidents.csv')
+    if os.path.exists(csv_path):
+        try:
+            return pd.read_csv(csv_path)
+        except Exception:
+            return generate_synthetic()
+    return generate_synthetic()
+
+
+def ensure_damage_column(df):
+    # If dataset doesn't include a Damage column, derive it heuristically
+    if 'Damage' in df.columns:
+        return df
+    def _label(row):
+        try:
+            if int(row.get('Accident', 0)) == 0:
+                return 'None'
+        except Exception:
+            if row.get('Accident') in (0,'0','No'):
+                return 'None'
+        speed = float(row.get('Speed_Limit', 60.0) or 60.0)
+        score = 0.0
+        if row.get('Weather') != 'Clear':
+            score += 0.3
+        if row.get('Road_Condition') != 'Dry':
+            score += 0.25
+        score += min(1.0, speed / 120.0)
+        if float(row.get('Vehicles_Nearby', 0) or 0) > 5:
+            score += 0.15
+        if float(row.get('Alcohol', 0) or 0) > 0:
+            score += 0.4
+        if score < 0.6:
+            return 'Minor'
+        return 'Moderate' if score < 1.2 else 'Severe'
+
+    df['Damage'] = df.apply(_label, axis=1)
+    return df
+
+
+def normalize_and_fill_features(df, features):
+    """Normalize column names to expected feature names and fill missing features with safe defaults.
+
+    This helps when users provide Excel/CSV files with slightly different headers (spaces, case,
+    or alternative names).
+    """
+    df = df.copy()
+    # build mapping of common variants to canonical names
+    canonical = {
+        'weather': 'Weather', 'road_type': 'Road_Type', 'road type': 'Road_Type', 'roadtype': 'Road_Type',
+        'time_of_day': 'Time_of_Day', 'time of day': 'Time_of_Day', 'timeofday': 'Time_of_Day',
+        'road_condition': 'Road_Condition', 'road condition': 'Road_Condition',
+        'vehicle_type': 'Vehicle_Type', 'vehicle type': 'Vehicle_Type',
+        'traffic_density': 'Traffic_Density', 'traffic density': 'Traffic_Density',
+        'speed_limit': 'Speed_Limit', 'speed limit': 'Speed_Limit',
+        'vehicles_nearby': 'Vehicles_Nearby', 'vehicles nearby': 'Vehicles_Nearby',
+        'driver_age': 'Driver_Age', 'driver age': 'Driver_Age',
+        'driving_experience': 'Driving_Experience', 'driving experience': 'Driving_Experience',
+        'alcohol': 'Alcohol',
+        'light_condition': 'Light_Condition', 'light condition': 'Light_Condition',
+        'accident': 'Accident',
+        'accident_type': 'Accident_Type', 'accident type': 'Accident_Type',
+        'area': 'Area',
+        'damage': 'Damage',
+        'date': 'Date', 'reported_date': 'Date', 'reportdate': 'Date'
+    }
+
+    # Make a lower->original mapping for existing columns
+    col_map = {}
+    for col in df.columns:
+        key = col.strip().lower().replace('-', ' ').replace('\t', ' ')
+        key = ' '.join(key.split())
+        if key in canonical:
+            col_map[col] = canonical[key]
+        else:
+            # also try converting underscores/spaces
+            key2 = key.replace(' ', '_')
+            if key2 in canonical:
+                col_map[col] = canonical[key2]
+
+    if col_map:
+        df = df.rename(columns=col_map)
+
+    # Ensure Damage exists
+    if 'Damage' not in df.columns:
+        try:
+            df = ensure_damage_column(df)
+        except Exception:
+            df['Damage'] = 'None'
+
+    # Fill any missing expected feature columns with safe defaults
+    defaults = {
+        'Weather': 'Clear', 'Road_Type': 'Urban', 'Time_of_Day': 'Afternoon',
+        'Road_Condition': 'Dry', 'Vehicle_Type': 'Bus', 'Traffic_Density': 0.0,
+        'Speed_Limit': 50, 'Vehicles_Nearby': 0, 'Driver_Age': 35,
+        'Driving_Experience': 5, 'Alcohol': 0, 'Light_Condition': 'Daylight'
+    }
+
+    for f in features:
+        if f not in df.columns:
+            df[f] = defaults.get(f, np.nan)
+
+    # If Accident column missing, try to infer from Damage/Accident_Type or add zeros
+    if 'Accident' not in df.columns:
+        if 'Damage' in df.columns:
+            df['Accident'] = df['Damage'].apply(
+                lambda x: (
+                    0
+                    if pd.isna(x) or str(x).lower() in {'none', 'no', '0'}
+                    else 1
+                )
+            )
+        else:
+            df['Accident'] = 0
+
+    return df
 
 
 def train_models(df, features, target='Accident'):
@@ -150,37 +282,81 @@ def train_models(df, features, target='Accident'):
     accident_rows = df[df['Accident']==1]
     type_model = None
     area_model = None
+    damage_model = None
     # Train type/area models on accident rows if enough data, otherwise try full dataset (dropna)
     if len(accident_rows) >= 20:
-        type_model = _extracted_from_train_models_31(
-            accident_rows, features, 'Accident_Type', preproc
-        )
-        area_model = _extracted_from_train_models_31(
-            accident_rows, features, 'Area', preproc
-        )
+        # Accident_Type
+        if 'Accident_Type' in accident_rows.columns and accident_rows['Accident_Type'].dropna().shape[0] >= 10:
+            try:
+                type_model = _extracted_from_train_models_31(
+                    accident_rows[accident_rows['Accident_Type'].notna()], features, 'Accident_Type', preproc
+                )
+            except Exception:
+                type_model = None
+        # Area
+        if 'Area' in accident_rows.columns and accident_rows['Area'].dropna().shape[0] >= 10:
+            try:
+                area_model = _extracted_from_train_models_31(
+                    accident_rows[accident_rows['Area'].notna()], features, 'Area', preproc
+                )
+            except Exception:
+                area_model = None
+        # damage model trained on accident rows (damage only meaningful for accidents)
+        if 'Damage' in accident_rows.columns and accident_rows['Damage'].dropna().shape[0] >= 10:
+            try:
+                damage_model = _extracted_from_train_models_31(
+                    accident_rows[accident_rows['Damage'].notna()], features, 'Damage', preproc
+                )
+            except Exception:
+                damage_model = None
+            # persist damage model for faster future loads
+            with contextlib.suppress(Exception):
+                joblib.dump(damage_model, os.path.join('models', 'accident_damage_model.joblib'))
     else:
-        # try training on any rows that have Accident_Type/Area defined
-        if df['Accident_Type'].dropna().shape[0] >= 10:
-            type_model = _extracted_from_train_models_31(
-                df[df['Accident_Type'].notna()], features, 'Accident_Type', preproc
-            )
-        if df['Area'].dropna().shape[0] >= 10:
-            area_model = _extracted_from_train_models_31(
-                df[df['Area'].notna()], features, 'Area', preproc
-            )
-    return results, pipelines, type_model, area_model
+            # try training on any rows that have Accident_Type/Area defined
+            if 'Accident_Type' in df.columns and df['Accident_Type'].dropna().shape[0] >= 10:
+                try:
+                    type_model = _extracted_from_train_models_31(
+                        df[df['Accident_Type'].notna()], features, 'Accident_Type', preproc
+                    )
+                except Exception:
+                    type_model = None
+            if 'Area' in df.columns and df['Area'].dropna().shape[0] >= 10:
+                try:
+                    area_model = _extracted_from_train_models_31(
+                        df[df['Area'].notna()], features, 'Area', preproc
+                    )
+                except Exception:
+                    area_model = None
+            if 'Damage' in df.columns and df['Damage'].dropna().shape[0] >= 10:
+                try:
+                    damage_model = _extracted_from_train_models_31(
+                        df[df['Damage'].notna()], features, 'Damage', preproc
+                    )
+                except Exception:
+                    damage_model = None
+                with contextlib.suppress(Exception):
+                    joblib.dump(damage_model, os.path.join('models', 'accident_damage_model.joblib'))
+    return results, pipelines, type_model, area_model, damage_model
 
 
 # TODO Rename this here and in `train_models`
 def _extracted_from_train_models_31(accident_rows, features, arg2, preproc):
-    X_type = accident_rows[features]
-    y_type = accident_rows[arg2]
+    # drop rows with missing target or missing feature values
+    df_local = accident_rows.copy()
+    required = list(features) + [arg2]
+    df_local = df_local.dropna(subset=required)
+    if df_local.shape[0] < 5:
+        # not enough data to train
+        raise ValueError(f'Not enough rows to train {arg2} model after dropping NaNs')
+    X_type = df_local[features]
+    y_type = df_local[arg2].astype(str)
     pipe_type = Pipeline([('pre', preproc), ('clf', RandomForestClassifier(n_estimators=100))])
     pipe_type.fit(X_type, y_type)
     return pipe_type
 
 
-def build_ui(df, features, results, pipelines, type_model, area_model):
+def build_ui(df, features, results, pipelines, type_model, area_model, damage_model=None):
     st.title('Accident Prediction System')
     st.caption('Predicts chance of an accident, type, and likely area. Models trained on available data.')
 
@@ -218,18 +394,144 @@ def build_ui(df, features, results, pipelines, type_model, area_model):
         'Alcohol': 1 if Alcohol >= 0.5 else 0,
         'Light_Condition': Light_Condition,
     }
+    
+    def _shorten(labels, maxlen=12):
+        out = []
+        for l in labels:
+            s = str(l)
+            s = s.replace('\n', ' ').strip()
+            if len(s) > maxlen:
+                out.append(s[:maxlen-3] + '...')
+            else:
+                out.append(s)
+        return out
+
+    def _clean_damage_label(lbl):
+        """Remove currency/amount text from damage labels for cleaner display."""
+        try:
+            s = str(lbl)
+        except Exception:
+            return lbl
+        # cut at common separators that introduce cost information
+        for sep in ['<', 'Rs', '₹', 'INR', '$', '(']:
+            idx = s.find(sep)
+            if idx != -1:
+                s = s[:idx]
+        return s.strip()
+
+    def _normalize_class_probs(labels, probs):
+        """Normalize labels (case/spacing), merge duplicates and return ordered lists.
+
+        Returns (labels_out, probs_out) sorted by prob desc.
+        """
+        from collections import defaultdict
+        norm_map = {}
+        sums = defaultdict(float)
+        for lab, p in zip(labels, probs):
+            try:
+                s = str(lab).strip()
+            except Exception:
+                s = str(lab)
+            key = ' '.join(s.lower().split())
+            # canonicalize common synonyms
+            if key in ('fatal', 'f a t a l'):
+                canon = 'Fatal'
+            elif 'minor' in key:
+                canon = 'Minor Injury'
+            elif 'non' in key and 'inj' in key:
+                canon = 'Non Injury'
+            elif 'griev' in key:
+                # filter out grievous entries by returning empty key
+                canon = None
+            else:
+                canon = s.title()
+            if canon is None:
+                continue
+            sums[canon] += float(p)
+
+        # normalize sums to ensure they sum to 1 across remaining classes
+        total = sum(sums.values())
+        if total <= 0:
+            # fallback: return original labels/probs but dedup case-insensitively
+            out_map = {}
+            for lab, p in zip(labels, probs):
+                k = ' '.join(str(lab).lower().split())
+                out_map[k] = out_map.get(k, 0.0) + float(p)
+            items = sorted(out_map.items(), key=lambda x: x[1], reverse=True)
+            labs = [k.title() for k, _ in items]
+            ps = [v for _, v in items]
+            return labs, ps
+
+        # normalize
+        items = sorted(sums.items(), key=lambda x: x[1], reverse=True)
+        labels_out = [it[0] for it in items]
+        probs_out = [it[1] / total for it in items]
+        return labels_out, probs_out
+
+    def _is_currency_label(s):
+        try:
+            stg = str(s).lower()
+        except Exception:
+            return False
+        # detect rupee/currency patterns or labels that start with numbers
+        if any(tok in stg for tok in ['rs', '₹', 'inr', '$']):
+            return True
+        # 'rs1000' patterns
+        import re
+        if re.search(r'\brs\s*\d', stg):
+            return True
+        if re.match(r'^\d+$', stg.strip()):
+            return True
+        return False
 
     col1, col2 = st.columns([1,1])
     with col1:
         if st.button('Predict'):
+            # build input dataframe with exact feature columns and dtypes
             input_df = pd.DataFrame([input_dict])
-            best_name = max(results.items(), key=lambda x: x[1]['mean_acc'])[0]
-            best_pipe = pipelines[best_name]
+            # ensure columns order and presence match training `features`
+            try:
+                input_df = input_df[features]
+            except Exception:
+                # add any missing features with defaults
+                for f in features:
+                    if f not in input_df.columns:
+                        input_df[f] = np.nan
+                input_df = input_df[features]
+
+            # Prefer using an explicit RandomForest pipeline if available so predictions react to inputs
+            model_to_use = None
+            if 'RandomForest' in pipelines:
+                model_to_use = pipelines['RandomForest']
+            elif 'SavedBest' in pipelines:
+                model_to_use = pipelines['SavedBest']
+            else:
+                # fallback to best by CV
+                best_name = max(results.items(), key=lambda x: x[1]['mean_acc'])[0]
+                model_to_use = pipelines.get(best_name)
+
             prob = None
             try:
-                prob = float(best_pipe.predict_proba(input_df)[0][1])
+                # prefer predict_proba when available
+                if hasattr(model_to_use, 'predict_proba'):
+                    prob = float(model_to_use.predict_proba(input_df)[0][1])
+                else:
+                    prob = float(model_to_use.predict(input_df)[0])
             except Exception:
-                prob = float(best_pipe.predict(input_df)[0])
+                # last resort: use any pipeline present
+                try:
+                    fallback = list(pipelines.values())[0]
+                    if hasattr(fallback, 'predict_proba'):
+                        prob = float(fallback.predict_proba(input_df)[0][1])
+                    else:
+                        prob = float(fallback.predict(input_df)[0])
+                except Exception:
+                    prob = 0.0
+            # show which model produced the prediction
+            try:
+                st.caption(f"Using model: {getattr(model_to_use, '__class__', model_to_use)}")
+            except Exception:
+                pass
 
             st.markdown(f"**Predicted accident probability:** {prob:.2%}")
             # --- Weighted preprocessing vector & baseline risk ---
@@ -264,22 +566,146 @@ def build_ui(df, features, results, pipelines, type_model, area_model):
                     st.markdown(f"**Weighted-model predicted risk:** {weighted_pred:.2%}")
                 except Exception:
                     weighted_pred = None
+            # --- Combine predictions with logic-based adjustments ---
+            try:
+                model_prob = float(prob)
+            except Exception:
+                model_prob = None
+
+            sources = {}
+            if model_prob is not None:
+                sources['Model'] = model_prob
+            if 'baseline_risk' in locals() and baseline_risk is not None:
+                sources['Baseline'] = float(baseline_risk)
+            if weighted_pred is not None:
+                sources['WeightedModel'] = float(weighted_pred)
+
+            # default weights (prefer model if available)
+            weights = {}
+            if 'Model' in sources:
+                weights['Model'] = 0.6
+            if 'Baseline' in sources:
+                weights['Baseline'] = 0.25
+            if 'WeightedModel' in sources:
+                weights['WeightedModel'] = 0.15
+
+            # normalize weights to sum to 1
+            if sum(weights.values()) == 0 and len(sources) > 0:
+                for k in sources:
+                    weights[k] = 1.0 / len(sources)
+            else:
+                s = sum(weights.values())
+                if s > 0:
+                    for k in weights:
+                        weights[k] = weights[k] / s
+
+            # rule-based adjustment: small additive increases for risky conditions
+            rule_adj = 0.0
+            try:
+                ai = float(input_dict.get('Alcohol', 0))
+                if ai >= 0.5:
+                    rule_adj += 0.10
+                sl = float(input_dict.get('Speed_Limit', 0))
+                if sl > 100:
+                    rule_adj += 0.08
+                elif sl > 80:
+                    rule_adj += 0.04
+                if input_dict.get('Road_Condition') not in (None, 'Dry'):
+                    rule_adj += 0.06
+                td = float(input_dict.get('Traffic_Density', 0.0))
+                if td > 7:
+                    rule_adj += 0.04
+                da = float(input_dict.get('Driver_Age', 99))
+                if da < 22:
+                    rule_adj += 0.03
+                de = float(input_dict.get('Driving_Experience', 99))
+                if de < 2:
+                    rule_adj += 0.03
+            except Exception:
+                rule_adj = 0.0
+            rule_adj = min(rule_adj, 0.35)
+
+            # compute final risk as weighted sum + rule_adj (capped)
+            contributions = {}
+            final_risk = 0.0
+            for k, v in sources.items():
+                w = weights.get(k, 0.0)
+                contrib = float(v) * w
+                contributions[k] = {'value': float(v), 'weight': w, 'contribution': contrib}
+                final_risk += contrib
+            final_risk = float(final_risk + rule_adj)
+            final_risk = max(0.0, min(1.0, final_risk))
+
+            # display breakdown
+            try:
+                import pandas as _pd
+                br = []
+                for k, d in contributions.items():
+                    br.append({'Source': k, 'Value': d['value'], 'Weight': round(d['weight'], 3), 'Contribution': round(d['contribution'], 4)})
+                br.append({'Source': 'Rule_Adjust', 'Value': round(rule_adj, 4), 'Weight': '', 'Contribution': round(rule_adj, 4)})
+                br_df = _pd.DataFrame(br).set_index('Source')
+                st.subheader('Risk calculation breakdown')
+                st.table(br_df)
+            except Exception:
+                pass
+
+            st.subheader('Final combined risk')
+            st.metric('Final predicted accident risk', f"{final_risk:.2%}")
             # Predict Accident Type and Area regardless of probability if models exist
+            # Accident Type prediction: show top-3 with probabilities and a clear bar chart
             if type_model is not None:
                 try:
                     probs_type = type_model.predict_proba(input_df)[0]
-                    classes_type = type_model.classes_
-                    top_idx = np.argmax(probs_type)
-                    pred_type = classes_type[top_idx]
-                    st.markdown(f"**Predicted Accident Type:** {pred_type}")
-                    fig_t, ax_t = plt.subplots()
-                    ax_t.bar(classes_type, probs_type, color=plt.cm.Pastel1(np.linspace(0,1,len(classes_type))))
-                    _extracted_from_build_ui_63(ax_t, 'Accident Type Probabilities', fig_t)
+                    classes_type = list(type_model.classes_)
+                    # normalize/merge duplicate class labels and probs
+                    norm_labels, norm_probs = _normalize_class_probs(classes_type, probs_type)
+                    if len(norm_labels) == 0:
+                        st.markdown("**Predicted Accident Type:** Unknown")
+                    else:
+                        topk = min(3, len(norm_labels))
+                        pred_type = norm_labels[0]
+                        st.markdown(f"**Predicted Accident Type:** {pred_type}")
+                        st.write('Top predicted types:')
+                        for lab, p in zip(norm_labels[:topk], norm_probs[:topk]):
+                            st.write(f"- {lab}: {p:.1%}")
+
+                        # full probability bar chart (short labels)
+                        fig_t, ax_t = plt.subplots(figsize=(8,3))
+                        short = _shorten(norm_labels, maxlen=14)
+                        sns.barplot(x=short, y=norm_probs, palette='mako', ax=ax_t)
+                        ax_t.set_ylim(0,1)
+                        ax_t.set_ylabel('Probability')
+                        ax_t.set_title('Accident Type Probabilities')
+                        ax_t.set_xticklabels(short, rotation=45, ha='right')
+                        for i, v in enumerate(norm_probs):
+                            if v > 0:
+                                ax_t.text(i, v + 0.02, f"{v:.1%}", ha='center', fontsize=9)
+                        fig_t.tight_layout()
+                        fig_t.subplots_adjust(bottom=0.28)
+                        st.pyplot(fig_t)
                 except Exception:
-                    pred_type = type_model.predict(input_df)[0]
-                    st.markdown(f"**Predicted Accident Type:** {pred_type}")
+                    # fallback to direct predict
+                    try:
+                        pred_type = type_model.predict(input_df)[0]
+                        st.markdown(f"**Predicted Accident Type:** {pred_type}")
+                    except Exception:
+                        st.markdown("**Predicted Accident Type:** Unknown")
             else:
-                st.markdown("**Predicted Accident Type:** Model not available")
+                # fallback: if dataset contains Accident_Type column, show most frequent types
+                if 'Accident_Type' in df.columns:
+                    counts = df['Accident_Type'].value_counts().head(5)
+                    st.markdown('**Predicted Accident Type:** Model not available — dataset frequencies:')
+                    for lab, v in counts.items():
+                        st.write(f"- {lab}: {v}")
+                    # small horizontal bar chart for frequencies
+                    fig_f, ax_f = plt.subplots(figsize=(6, max(2, len(counts)*0.4)))
+                    sns.barplot(x=counts.values, y=[str(x) for x in counts.index], palette='pastel', orient='h', ax=ax_f)
+                    ax_f.set_xlabel('Count')
+                    ax_f.set_title('Accident Type Distribution (dataset)')
+                    fig_f.tight_layout()
+                    st.pyplot(fig_f)
+                else:
+                    st.markdown("**Predicted Accident Type:** Model not available")
 
             if area_model is not None:
                 try:
@@ -288,14 +714,69 @@ def build_ui(df, features, results, pipelines, type_model, area_model):
                     top_idx = np.argmax(probs_area)
                     pred_area = classes_area[top_idx]
                     st.markdown(f"**Likely Area of Occurrence:** {pred_area}")
-                    fig_a, ax_a = plt.subplots()
-                    ax_a.bar(classes_area, probs_area, color=plt.cm.Pastel2(np.linspace(0,1,len(classes_area))))
-                    _extracted_from_build_ui_63(ax_a, 'Area Probabilities', fig_a)
+                    fig_a, ax_a = plt.subplots(figsize=(8,3))
+                    labels_a = [str(c) for c in classes_area]
+                    short_a = _shorten(labels_a, maxlen=12)
+                    sns.barplot(x=short_a, y=probs_area, palette='viridis', ax=ax_a)
+                    ax_a.set_ylim(0,1)
+                    ax_a.set_ylabel('Probability')
+                    ax_a.set_title('Area Probabilities')
+                    ax_a.set_xticklabels(short_a, rotation=45, ha='right')
+                    for i, v in enumerate(probs_area):
+                        if v > 0:
+                            ax_a.text(i, v + 0.02, f"{v:.1%}", ha='center', fontsize=9)
+                    fig_a.tight_layout()
+                    fig_a.subplots_adjust(bottom=0.28)
+                    st.pyplot(fig_a)
                 except Exception:
                     pred_area = area_model.predict(input_df)[0]
                     st.markdown(f"**Likely Area of Occurrence:** {pred_area}")
             else:
                 st.markdown("**Likely Area of Occurrence:** Model not available")
+
+            # --- Damage prediction ---
+            if damage_model is not None:
+                try:
+                    probs_damage = damage_model.predict_proba(input_df)[0]
+                    classes_damage = damage_model.classes_
+                    top_idx = np.argmax(probs_damage)
+                    pred_damage = classes_damage[top_idx]
+                    st.markdown(f"**Predicted Damage Level:** {_clean_damage_label(pred_damage)}")
+                    labels_d = [str(c) for c in classes_damage]
+                    # clean and filter out currency/amount labels and 'Grievous' entries
+                    cleaned = [_clean_damage_label(l) for l in labels_d]
+                    filtered_pairs = [(lab, p) for lab, p in zip(cleaned, probs_damage)
+                                                          if (not _is_currency_label(lab)) and ('griev' not in lab.lower()) and lab.strip()] or [(lab, p) for lab, p in zip(cleaned, probs_damage) if lab.strip()]
+                    short_d = [fp[0] for fp in filtered_pairs]
+                    probs_filtered = [fp[1] for fp in filtered_pairs]
+                    fig_dmg, ax_dmg = plt.subplots(figsize=(8, max(3, len(short_d)*0.25)))
+                    if len(short_d) > 6 or any(len(s) > 10 for s in short_d):
+                        sns.barplot(x=probs_filtered, y=short_d, palette='rocket', orient='h', ax=ax_dmg)
+                        ax_dmg.set_xlim(0,1)
+                        ax_dmg.set_xlabel('Probability')
+                        ax_dmg.set_title('Damage Level Probabilities')
+                        for i, (lab, v) in enumerate(zip(short_d, probs_filtered)):
+                            if v > 0:
+                                ax_dmg.text(v + 0.02, i, f"{v:.1%}", va='center', fontsize=9)
+                        fig_dmg.tight_layout()
+                        fig_dmg.subplots_adjust(left=0.28)
+                    else:
+                        sns.barplot(x=short_d, y=probs_filtered, palette='rocket', ax=ax_dmg)
+                        ax_dmg.set_ylim(0,1)
+                        ax_dmg.set_ylabel('Probability')
+                        ax_dmg.set_title('Damage Level Probabilities')
+                        ax_dmg.set_xticklabels(short_d, rotation=45, ha='right')
+                        for i, v in enumerate(probs_filtered):
+                            if v > 0:
+                                ax_dmg.text(i, v + 0.02, f"{v:.1%}", ha='center', fontsize=9)
+                        fig_dmg.tight_layout()
+                        fig_dmg.subplots_adjust(bottom=0.28)
+                    st.pyplot(fig_dmg)
+                except Exception:
+                    pred_damage = damage_model.predict(input_df)[0]
+                    st.markdown(f"**Predicted Damage Level:** {_clean_damage_label(pred_damage)}")
+            else:
+                st.markdown("**Predicted Damage Level:** Model not available")
 
             # show baseline distributions from dataset
             st.markdown('**Dataset distributions**')
@@ -307,15 +788,24 @@ def build_ui(df, features, results, pipelines, type_model, area_model):
             # Accident type distribution
             if 'Accident_Type' in df_plot.columns:
                 type_counts = df_plot['Accident_Type'].value_counts()
-                axs[1].bar(type_counts.index.astype(str), type_counts.values, color=plt.cm.Pastel1(np.linspace(0,1,len(type_counts))))
+                # remove 'Grievous' entries and currency-like labels
+                filt_idx = [i for i in type_counts.index if ('griev' not in str(i).lower()) and (not _is_currency_label(i))]
+                type_counts = type_counts.reindex(filt_idx)
+                labels_t = [str(x) for x in type_counts.index.astype(str)]
+                short_t = _shorten(labels_t, maxlen=12)
+                axs[1].bar(short_t, type_counts.values, color=plt.cm.Pastel1(np.linspace(0,1,len(type_counts))))
                 axs[1].set_title('Accident Type')
+                axs[1].set_xticklabels(short_t, rotation=45, ha='right')
             else:
                 axs[1].text(0.5,0.5,'No Accident_Type', ha='center')
             # Area distribution
             if 'Area' in df_plot.columns:
                 area_counts = df_plot['Area'].value_counts()
-                axs[2].bar(area_counts.index.astype(str), area_counts.values, color=plt.cm.Pastel2(np.linspace(0,1,len(area_counts))))
+                labels_a = [str(x) for x in area_counts.index.astype(str)]
+                short_a = _shorten(labels_a, maxlen=12)
+                axs[2].bar(short_a, area_counts.values, color=plt.cm.Pastel2(np.linspace(0,1,len(area_counts))))
                 axs[2].set_title('Area')
+                axs[2].set_xticklabels(short_a, rotation=45, ha='right')
             else:
                 axs[2].text(0.5,0.5,'No Area', ha='center')
             plt.tight_layout()
@@ -547,15 +1037,197 @@ def build_ui(df, features, results, pipelines, type_model, area_model):
             rating = dp.get_driver_risk_rating(driver_id)
             st.write('Driver long-term risk rating (0-100):', rating)
             # show driver history if exists
-            try:
+            with contextlib.suppress(Exception):
                 hist = dp.store.get(driver_id, {}).get('history', [])
                 if hist:
                     hist_df = pd.DataFrame(hist)
                     hist_df['ts'] = pd.to_datetime(hist_df['ts'])
                     hist_df = hist_df.set_index('ts')
                     st.line_chart(hist_df['risk'])
+
+        # --- Analysis & Forecasting section ---
+        st.header('Analysis & 10-year Monthly Forecast')
+        st.markdown('Correlation heatmap of numeric and encoded categorical features')
+
+        def plot_correlation_heatmap(df):
+            # prepare a mixed dataframe: numeric cols and one-hot encoded categoricals (limited)
+            df2 = df.copy()
+            # select categorical columns to one-hot (limit to avoid explosion)
+            cat_cols = df2.select_dtypes(include=['object']).columns.tolist()
+            cat_cols = [c for c in cat_cols if df2[c].nunique() <= 12]
+            df_enc = pd.get_dummies(df2[cat_cols].astype(str), drop_first=True)
+            num = df2.select_dtypes(include=[np.number]).copy()
+            if num.shape[1] == 0 and df_enc.shape[1] == 0:
+                st.write('No numeric or low-cardinality categorical features to show correlation for.')
+                return
+            combined = pd.concat([num, df_enc], axis=1)
+            # if too many columns, select top-k by variance to improve readability
+            max_cols = 40
+            if combined.shape[1] > max_cols:
+                vars_ = combined.var().sort_values(ascending=False).head(max_cols).index.tolist()
+                corr_df = combined[vars_].corr()
+                annotate = False
+            else:
+                corr_df = combined.corr()
+                annotate = True if corr_df.shape[0] <= 30 else False
+
+            fig_w = min(18, max(8, corr_df.shape[0] * 0.25))
+            fig_h = min(18, max(6, corr_df.shape[1] * 0.25))
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            sns.heatmap(corr_df, annot=annotate, fmt='.2f' if annotate else '', cmap='coolwarm', center=0, ax=ax, cbar_kws={'shrink':0.6})
+            ax.set_title('Correlation Heatmap')
+            plt.xticks(rotation=90)
+            plt.yticks(rotation=0)
+            fig.tight_layout()
+            st.pyplot(fig)
+
+        plot_correlation_heatmap(df)
+
+        # Forecasting utilities
+        def _detect_date_col(df):
+            candidates = ['Date','date','Timestamp','timestamp','Reported_Date','reported_date','ReportDate','report_date']
+            for c in candidates:
+                if c in df.columns:
+                    return c
+            # also check for Year/Month
+            if 'Year' in df.columns and 'Month' in df.columns:
+                return ('Year','Month')
+            return None
+
+        def build_monthly_ts(df, type_col='Accident_Type'):
+            # returns monthly counts DataFrame indexed by period (MS)
+            dc = _detect_date_col(df)
+            df_copy = df.copy()
+            if isinstance(dc, tuple):
+                df_copy['date'] = pd.to_datetime(df_copy['Year'].astype(str) + '-' + df_copy['Month'].astype(str) + '-01')
+            elif dc is not None:
+                df_copy['date'] = pd.to_datetime(df_copy[dc], errors='coerce')
+            else:
+                # synthesize dates spanning last 5 years evenly
+                n = df_copy.shape[0]
+                end = pd.Timestamp.today()
+                start = end - pd.DateOffset(years=5)
+                dates = pd.date_range(start=start, end=end, periods=n)
+                df_copy['date'] = dates
+
+            df_copy = df_copy.dropna(subset=['date'])
+            df_copy['period'] = df_copy['date'].dt.to_period('M').dt.to_timestamp()
+            # Only consider rows where accident happened
+            if 'Accident' in df_copy.columns:
+                df_copy = df_copy[df_copy['Accident'].astype(int) == 1]
+            # group by period and type
+            if type_col not in df_copy.columns:
+                df_copy[type_col] = 'Unknown'
+            grp = df_copy.groupby(['period', type_col]).size().unstack(fill_value=0)
+            # ensure continuous monthly index
+            idx = pd.date_range(start=grp.index.min(), end=grp.index.max(), freq='MS')
+            grp = grp.reindex(idx, fill_value=0)
+            grp.index.name = 'period'
+            return grp
+
+        def seasonal_trend_forecast(ts, months_ahead=120):
+            # ts is pd.Series indexed by Timestamp (monthly)
+            # seasonal component: average for each month-of-year
+            df = ts.copy()
+            df = df.asfreq('MS').fillna(0)
+            months = np.arange(len(df))
+            # linear trend fit
+            try:
+                coef = np.polyfit(months, df.values, 1)
+                trend = np.polyval(coef, np.concatenate([months, months[-1] + np.arange(1, months_ahead+1)]))
             except Exception:
-                pass
+                trend = np.concatenate([df.values, np.full(months_ahead, df.mean())])
+            # seasonal pattern
+            month_of_year = df.index.month
+            seasonal = df.groupby(month_of_year).mean()
+            # build forecast index
+            last = df.index[-1]
+            future_idx = pd.date_range(start=last + pd.offsets.MonthBegin(1), periods=months_ahead, freq='MS')
+            season_values = np.array([seasonal.get(m, df.mean()) for m in future_idx.month])
+            forecast_values = trend[-months_ahead:] + season_values
+            forecast_values = np.where(forecast_values < 0, 0, forecast_values)
+            return pd.Series(forecast_values, index=future_idx)
+
+        # build monthly ts for all accident types
+        monthly = build_monthly_ts(df)
+        if monthly.shape[0] == 0:
+            st.write('Not enough accident records to build monthly time series for forecasting.')
+            return
+
+        months_ahead = st.slider('Months to forecast (max 120)', 12, 120, 120, 12)
+        st.write(f'Forecasting next {months_ahead} months ({months_ahead/12:.1f} years)')
+
+        # compute forecasts per type
+        forecasts = {}
+        for col in monthly.columns:
+            ser = monthly[col]
+            f = seasonal_trend_forecast(ser, months_ahead=months_ahead)
+            forecasts[col] = f
+        forecasts_df = pd.DataFrame(forecasts)
+
+        # Yearly aggregated forecast lines (plot only top types + 'Other' to avoid overcrowded legend)
+        # reduce to top N types by historical total
+        totals = monthly.sum().sort_values(ascending=False)
+        top_n = min(6, len(totals))
+        top_types = totals.index[:top_n].tolist()
+        other_types = [c for c in monthly.columns if c not in top_types]
+
+        monthly_reduced = monthly[top_types].copy()
+        if other_types:
+            monthly_reduced['Other'] = monthly[other_types].sum(axis=1)
+
+        forecasts_reduced = forecasts_df.reindex(columns=top_types, fill_value=0).copy()
+        if other_types:
+            forecasts_reduced['Other'] = forecasts_df[other_types].sum(axis=1)
+
+        yearly_hist = monthly_reduced.resample('Y').sum()
+        yearly_fore = forecasts_reduced.resample('Y').sum()
+
+        fig_line, ax_line = plt.subplots(figsize=(10,6))
+        years_hist_idx = yearly_hist.index.year
+        years_fore_idx = yearly_fore.index.year
+
+        cols = list(yearly_hist.columns)
+        colors = sns.color_palette('tab10', n_colors=len(cols))
+        for i, col in enumerate(cols):
+            hist_vals = yearly_hist[col].values if col in yearly_hist.columns else np.zeros(len(years_hist_idx))
+            fore_vals = yearly_fore[col].values if col in yearly_fore.columns else np.zeros(len(years_fore_idx))
+            lbl = _shorten([str(col)], maxlen=18)[0]
+            ax_line.plot(years_hist_idx, hist_vals, marker='o', color=colors[i], label=f'{lbl} (hist)', linewidth=1.5)
+            ax_line.plot(years_fore_idx, fore_vals, linestyle='--', marker='o', color=colors[i], label=f'{lbl} (pred)', linewidth=1.2)
+
+        ax_line.set_title('Yearly Accident Counts — Historical and Predicted')
+        ax_line.set_xlabel('Year')
+        ax_line.set_ylabel('Predicted accidents')
+        # place legend outside to the right to avoid overlapping the lines
+        ax_line.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=9)
+        fig_line.tight_layout()
+        st.pyplot(fig_line)
+
+        # Bar chart: actual (historical total) vs estimated (first forecast year)
+        actual_totals = monthly.sum()
+        est_first_year = forecasts_df.head(12).sum()
+        fig_bar, ax_bar = plt.subplots(figsize=(8,5))
+        width = 0.35
+        x = np.arange(len(actual_totals.index))
+        ax_bar.bar(x - width/2, actual_totals.values, width, label='Actual')
+        ax_bar.bar(x + width/2, est_first_year.reindex(actual_totals.index, fill_value=0).values, width, label='Estimated (next year)')
+        ax_bar.set_xticks(x)
+        short_xt = _shorten([str(i) for i in actual_totals.index], maxlen=12)
+        ax_bar.set_xticklabels(short_xt, rotation=45, ha='right')
+        ax_bar.set_ylabel('No. of accidents')
+        ax_bar.set_title('Actual vs Estimated accidents by Type')
+        maxv = max(actual_totals.values) if len(actual_totals.values) and max(actual_totals.values) > 0 else 1
+        for i, v in enumerate(actual_totals.values):
+            ax_bar.text(i - width/2, v + maxv*0.01, str(int(v)), ha='center', fontsize=9)
+        for i, v in enumerate(est_first_year.reindex(actual_totals.index, fill_value=0).values):
+            ax_bar.text(i + width/2, v + maxv*0.01, str(int(v)), ha='center', fontsize=9)
+        ax_bar.legend()
+        st.pyplot(fig_bar)
+
+        # allow user to download forecast csv
+        csv_buf = forecasts_df.reset_index().rename(columns={'index':'period'}).to_csv(index=False)
+        st.download_button('Download monthly forecast CSV', csv_buf, file_name='monthly_forecast.csv', mime='text/csv')
 
 
 # TODO Rename this here and in `build_ui`
@@ -574,6 +1246,25 @@ def _extracted_from_build_ui_80(arg0, y_pos, names_sorted, arg3):
 
 def main():
     df = load_data()
+    # ensure Damage column exists (derived if not present)
+    with contextlib.suppress(Exception):
+        df = ensure_damage_column(df)
+    # normalize column names and fill missing features to avoid KeyError during training
+    features = ['Weather','Road_Type','Time_of_Day','Road_Condition','Vehicle_Type',
+                'Traffic_Density','Speed_Limit','Vehicles_Nearby','Driver_Age','Driving_Experience','Alcohol','Light_Condition']
+    try:
+        df = normalize_and_fill_features(df, features)
+    except Exception as e:
+        # fallback: ensure all features exist and fill with safe defaults
+        defaults = {
+            'Weather': 'Clear', 'Road_Type': 'Urban', 'Time_of_Day': 'Afternoon',
+            'Road_Condition': 'Dry', 'Vehicle_Type': 'Bus', 'Traffic_Density': 0.0,
+            'Speed_Limit': 50, 'Vehicles_Nearby': 0, 'Driver_Age': 35,
+            'Driving_Experience': 5, 'Alcohol': 0, 'Light_Condition': 'Daylight'
+        }
+        for f in features:
+            if f not in df.columns:
+                df[f] = defaults.get(f, 0)
     features = ['Weather','Road_Type','Time_of_Day','Road_Condition','Vehicle_Type',
                 'Traffic_Density','Speed_Limit','Vehicles_Nearby','Driver_Age','Driving_Experience','Alcohol','Light_Condition']
     # If a persisted best model exists, load it to speed up prediction and still compute comparisons
@@ -586,7 +1277,7 @@ def main():
     else:
         best_pipe = None
 
-    results, pipelines, type_model, area_model = train_models(df, features)
+    results, pipelines, type_model, area_model, damage_model = train_models(df, features)
     # if we loaded a persisted best model, add it to pipelines under 'SavedBest'
     if best_pipe is not None:
         pipelines['SavedBest'] = best_pipe
@@ -594,7 +1285,7 @@ def main():
         with contextlib.suppress(Exception):
             acc = cross_val_score(best_pipe, df[features], df['Accident'], cv=5, scoring='accuracy')
             results['SavedBest'] = {'mean_acc': float(acc.mean()), 'std': float(acc.std())}
-    build_ui(df, features, results, pipelines, type_model, area_model)
+    build_ui(df, features, results, pipelines, type_model, area_model, damage_model)
 
 
 if __name__ == '__main__':
