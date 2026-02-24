@@ -1194,7 +1194,19 @@ def build_ui(df, features, results, pipelines, type_model, area_model, damage_mo
             fore_vals = yearly_fore[col].values if col in yearly_fore.columns else np.zeros(len(years_fore_idx))
             lbl = _shorten([str(col)], maxlen=18)[0]
             ax_line.plot(years_hist_idx, hist_vals, marker='o', color=colors[i], label=f'{lbl} (hist)', linewidth=1.5)
-            ax_line.plot(years_fore_idx, fore_vals, linestyle='--', marker='o', color=colors[i], label=f'{lbl} (pred)', linewidth=1.2)
+            # prepend the last historical point to the forecast so the dashed (pred) line
+            # connects smoothly to the historical series instead of appearing disjoint
+            if len(years_hist_idx) > 0 and len(years_fore_idx) > 0:
+                try:
+                    join_x = np.concatenate(([years_hist_idx[-1]], years_fore_idx))
+                    join_y = np.concatenate(([hist_vals[-1] if len(hist_vals) > 0 else 0], fore_vals))
+                except Exception:
+                    join_x = years_fore_idx
+                    join_y = fore_vals
+            else:
+                join_x = years_fore_idx
+                join_y = fore_vals
+            ax_line.plot(join_x, join_y, linestyle='--', marker='o', color=colors[i], label=f'{lbl} (pred)', linewidth=1.2)
 
         ax_line.set_title('Yearly Accident Counts — Historical and Predicted')
         ax_line.set_xlabel('Year')
@@ -1224,6 +1236,78 @@ def build_ui(df, features, results, pipelines, type_model, area_model, damage_mo
             ax_bar.text(i + width/2, v + maxv*0.01, str(int(v)), ha='center', fontsize=9)
         ax_bar.legend()
         st.pyplot(fig_bar)
+
+        # Two-year comparison: allow user to pick any two years (historical or forecast) and
+        # generate a side-by-side bar chart by accident type, save PNG and offer download.
+        year_options = []
+        hist_years = list(yearly_hist.index.year)
+        fore_years = list(yearly_fore.index.year)
+        year_options += [f"{y} (hist)" for y in hist_years]
+        year_options += [f"{y} (pred)" for y in fore_years]
+        if year_options:
+            col1, col2 = st.columns([1,1])
+            with col1:
+                sel_a = st.selectbox('Year A', year_options, index=0)
+            with col2:
+                sel_b = st.selectbox('Year B', year_options, index=1 if len(year_options) > 1 else 0)
+
+            def _get_year_row(label):
+                try:
+                    y = int(label.split()[0])
+                except Exception:
+                    return pd.Series(0, index=monthly_reduced.columns)
+                if '(hist)' in label:
+                    mask = [yy == y for yy in list(yearly_hist.index.year)]
+                    if any(mask):
+                        row = yearly_hist.iloc[[i for i,m in enumerate(mask) if m][0]]
+                    else:
+                        row = pd.Series(0, index=monthly_reduced.columns)
+                else:
+                    mask = [yy == y for yy in list(yearly_fore.index.year)]
+                    if any(mask):
+                        row = yearly_fore.iloc[[i for i,m in enumerate(mask) if m][0]]
+                    else:
+                        row = pd.Series(0, index=monthly_reduced.columns)
+                # ensure ordering matches reduced columns
+                return row.reindex(monthly_reduced.columns, fill_value=0)
+
+            vals_a = _get_year_row(sel_a)
+            vals_b = _get_year_row(sel_b)
+
+            fig_comp, ax_comp = plt.subplots(figsize=(10,6))
+            types = list(monthly_reduced.columns)
+            x = np.arange(len(types))
+            w = 0.35
+            ax_comp.bar(x - w/2, vals_a.values, w, label=sel_a)
+            ax_comp.bar(x + w/2, vals_b.values, w, label=sel_b)
+            ax_comp.set_xticks(x)
+            ax_comp.set_xticklabels(_shorten([str(i) for i in types], maxlen=12), rotation=45, ha='right')
+            ax_comp.set_ylabel('No. of accidents')
+            ax_comp.set_title(f'Comparison: {sel_a} vs {sel_b}')
+            maxv = max(max(vals_a.max(), vals_b.max()), 1)
+            for i, v in enumerate(vals_a.values):
+                ax_comp.text(i - w/2, v + maxv*0.01, str(int(v)), ha='center', fontsize=9)
+            for i, v in enumerate(vals_b.values):
+                ax_comp.text(i + w/2, v + maxv*0.01, str(int(v)), ha='center', fontsize=9)
+            ax_comp.legend()
+            fig_comp.tight_layout()
+            st.pyplot(fig_comp)
+
+            # save to outputs and provide download
+            outputs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'outputs'))
+            os.makedirs(outputs_dir, exist_ok=True)
+            safe_a = sel_a.replace(' ', '_').replace('(', '').replace(')', '')
+            safe_b = sel_b.replace(' ', '_').replace('(', '').replace(')', '')
+            fname = f'comparison_{safe_a}_vs_{safe_b}.png'
+            full_path = os.path.join(outputs_dir, fname)
+            try:
+                fig_comp.savefig(full_path, dpi=150)
+                with open(full_path, 'rb') as f:
+                    img_bytes = f.read()
+                st.download_button('Download comparison PNG', img_bytes, file_name=fname, mime='image/png')
+                st.success(f'Saved comparison image to {full_path}')
+            except Exception as e:
+                st.warning(f'Could not save comparison image: {e}')
 
         # allow user to download forecast csv
         csv_buf = forecasts_df.reset_index().rename(columns={'index':'period'}).to_csv(index=False)
