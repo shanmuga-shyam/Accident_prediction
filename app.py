@@ -240,6 +240,13 @@ def train_models(df, features, target='Accident'):
     }
     candidates['RandomForest'] = (RandomForestClassifier(random_state=42),
                                   {'clf__n_estimators':[100,150], 'clf__max_depth':[None,10]})
+    # Add SVM and Naive Bayes candidates for user-requested comparisons
+    with contextlib.suppress(Exception):
+        from sklearn.svm import SVC
+        candidates['SVM'] = (SVC(probability=True), {'clf__C': [0.1, 1.0]})
+    with contextlib.suppress(Exception):
+        from sklearn.naive_bayes import GaussianNB
+        candidates['NaiveBayes'] = (GaussianNB(), {})
     with contextlib.suppress(Exception):
         from xgboost import XGBClassifier
         candidates['XGBoost'] = (XGBClassifier(use_label_encoder=False, eval_metric='logloss', verbosity=0),
@@ -313,30 +320,30 @@ def train_models(df, features, target='Accident'):
             with contextlib.suppress(Exception):
                 joblib.dump(damage_model, os.path.join('models', 'accident_damage_model.joblib'))
     else:
-            # try training on any rows that have Accident_Type/Area defined
-            if 'Accident_Type' in df.columns and df['Accident_Type'].dropna().shape[0] >= 10:
-                try:
-                    type_model = _extracted_from_train_models_31(
-                        df[df['Accident_Type'].notna()], features, 'Accident_Type', preproc
-                    )
-                except Exception:
-                    type_model = None
-            if 'Area' in df.columns and df['Area'].dropna().shape[0] >= 10:
-                try:
-                    area_model = _extracted_from_train_models_31(
-                        df[df['Area'].notna()], features, 'Area', preproc
-                    )
-                except Exception:
-                    area_model = None
-            if 'Damage' in df.columns and df['Damage'].dropna().shape[0] >= 10:
-                try:
-                    damage_model = _extracted_from_train_models_31(
-                        df[df['Damage'].notna()], features, 'Damage', preproc
-                    )
-                except Exception:
-                    damage_model = None
-                with contextlib.suppress(Exception):
-                    joblib.dump(damage_model, os.path.join('models', 'accident_damage_model.joblib'))
+        # try training on any rows that have Accident_Type/Area defined
+        if 'Accident_Type' in df.columns and df['Accident_Type'].dropna().shape[0] >= 10:
+            try:
+                type_model = _extracted_from_train_models_31(
+                    df[df['Accident_Type'].notna()], features, 'Accident_Type', preproc
+                )
+            except Exception:
+                type_model = None
+        if 'Area' in df.columns and df['Area'].dropna().shape[0] >= 10:
+            try:
+                area_model = _extracted_from_train_models_31(
+                    df[df['Area'].notna()], features, 'Area', preproc
+                )
+            except Exception:
+                area_model = None
+        if 'Damage' in df.columns and df['Damage'].dropna().shape[0] >= 10:
+            try:
+                damage_model = _extracted_from_train_models_31(
+                    df[df['Damage'].notna()], features, 'Damage', preproc
+                )
+            except Exception:
+                damage_model = None
+            with contextlib.suppress(Exception):
+                joblib.dump(damage_model, os.path.join('models', 'accident_damage_model.joblib'))
     return results, pipelines, type_model, area_model, damage_model
 
 
@@ -394,6 +401,59 @@ def build_ui(df, features, results, pipelines, type_model, area_model, damage_mo
         'Alcohol': 1 if Alcohol >= 0.5 else 0,
         'Light_Condition': Light_Condition,
     }
+
+    # Auto-show simple model predictions (no need to press Predict)
+    try:
+        auto_show = st.checkbox('Auto-show model predictions', value=True)
+    except Exception:
+        auto_show = True
+    if auto_show:
+        with contextlib.suppress(Exception):
+            input_df_preview = pd.DataFrame([input_dict])
+            # ensure same column order as training features
+            try:
+                input_df_preview = input_df_preview[features]
+            except Exception:
+                for f in features:
+                    if f not in input_df_preview.columns:
+                        input_df_preview[f] = np.nan
+                input_df_preview = input_df_preview[features]
+
+            st.subheader('Quick model predictions')
+            cols = st.columns(3)
+            models_to_report = ['RandomForest', 'LogisticRegression', 'XGBoost', 'SVM', 'NaiveBayes']
+            for i, mname in enumerate(models_to_report):
+                col = cols[i % len(cols)]
+                with col:
+                    if mname in pipelines:
+                        mdl = pipelines[mname]
+                        try:
+                            if hasattr(mdl, 'predict_proba'):
+                                p = mdl.predict_proba(input_df_preview)[0]
+                                prob = float(p[1]) if p.shape[0] > 1 else float(p.ravel()[0])
+                            else:
+                                pred = mdl.predict(input_df_preview)[0]
+                                prob = float(pred)
+                        except Exception:
+                            prob = None
+                        if prob is None:
+                            col.write(f'{mname}: N/A')
+                        else:
+                            col.markdown(f'**{mname}**')
+                            col.metric('Predicted accident prob', f'{prob:.1%}')
+                            # tiny bar plot
+                            try:
+                                fig_s, ax_s = plt.subplots(figsize=(2.2,1.6))
+                                ax_s.bar(['No','Yes'], [1-prob, prob], color=['#8da0cb','#fc8d62'])
+                                ax_s.set_ylim(0,1)
+                                ax_s.set_xticklabels(['No','Yes'])
+                                ax_s.set_ylabel('Prob')
+                                fig_s.tight_layout()
+                                col.pyplot(fig_s)
+                            except Exception:
+                                pass
+                    else:
+                        col.write(f'{mname}: model not available')
     
     def _shorten(labels, maxlen=12):
         out = []
@@ -486,253 +546,256 @@ def build_ui(df, features, results, pipelines, type_model, area_model, damage_mo
 
     col1, col2 = st.columns([1,1])
     with col1:
-        if st.button('Predict'):
-            # build input dataframe with exact feature columns and dtypes
-            input_df = pd.DataFrame([input_dict])
-            # ensure columns order and presence match training `features`
-            try:
-                input_df = input_df[features]
-            except Exception:
-                # add any missing features with defaults
-                for f in features:
-                    if f not in input_df.columns:
-                        input_df[f] = np.nan
-                input_df = input_df[features]
+        # Run predictions automatically; keep Predict button for manual refresh
+        st.button('Predict')
+        # build input dataframe with exact feature columns and dtypes
+        input_df = pd.DataFrame([input_dict])
+        # ensure columns order and presence match training `features`
+        try:
+            input_df = input_df[features]
+        except Exception:
+            # add any missing features with defaults
+            for f in features:
+                if f not in input_df.columns:
+                    input_df[f] = np.nan
+            input_df = input_df[features]
 
-            # Prefer using an explicit RandomForest pipeline if available so predictions react to inputs
-            model_to_use = None
-            if 'RandomForest' in pipelines:
-                model_to_use = pipelines['RandomForest']
-            elif 'SavedBest' in pipelines:
-                model_to_use = pipelines['SavedBest']
+        # Prefer using an explicit RandomForest pipeline if available so predictions react to inputs
+        model_to_use = None
+        if 'RandomForest' in pipelines:
+            model_to_use = pipelines['RandomForest']
+        elif 'SavedBest' in pipelines:
+            model_to_use = pipelines['SavedBest']
+        else:
+            # fallback to best by CV
+            best_name = max(results.items(), key=lambda x: x[1]['mean_acc'])[0]
+            model_to_use = pipelines.get(best_name)
+
+        prob = None
+        try:
+            # prefer predict_proba when available
+            if hasattr(model_to_use, 'predict_proba'):
+                prob = float(model_to_use.predict_proba(input_df)[0][1])
             else:
-                # fallback to best by CV
-                best_name = max(results.items(), key=lambda x: x[1]['mean_acc'])[0]
-                model_to_use = pipelines.get(best_name)
-
-            prob = None
+                prob = float(model_to_use.predict(input_df)[0])
+        except Exception:
+            # last resort: use any pipeline present
             try:
-                # prefer predict_proba when available
-                if hasattr(model_to_use, 'predict_proba'):
-                    prob = float(model_to_use.predict_proba(input_df)[0][1])
+                fallback = list(pipelines.values())[0]
+                if hasattr(fallback, 'predict_proba'):
+                    prob = float(fallback.predict_proba(input_df)[0][1])
                 else:
-                    prob = float(model_to_use.predict(input_df)[0])
+                    prob = float(fallback.predict(input_df)[0])
             except Exception:
-                # last resort: use any pipeline present
-                try:
-                    fallback = list(pipelines.values())[0]
-                    if hasattr(fallback, 'predict_proba'):
-                        prob = float(fallback.predict_proba(input_df)[0][1])
-                    else:
-                        prob = float(fallback.predict(input_df)[0])
-                except Exception:
-                    prob = 0.0
-            # show which model produced the prediction
+                prob = 0.0
+        # show which model produced the prediction
+        try:
+            st.caption(f"Using model: {getattr(model_to_use, '__class__', model_to_use)}")
+        except Exception:
+            pass
+
+        st.markdown(f"**Predicted accident probability:** {prob:.2%}")
+        # --- Weighted preprocessing vector & baseline risk ---
+        mapped_input = {
+            'weather': input_dict.get('Weather'),
+            'road_type': input_dict.get('Road_Type'),
+            'time_of_day': input_dict.get('Time_of_Day'),
+            'road_condition': input_dict.get('Road_Condition') if input_dict.get('Road_Condition') != 'Icy' else 'Ice',
+            'light_condition': input_dict.get('Light_Condition') if input_dict.get('Light_Condition') != 'Dark' else 'No Street Light',
+            'traffic_density': float(input_dict.get('Traffic_Density', 0.0)),
+            'speed_limit': float(input_dict.get('Speed_Limit', 20.0)),
+            'vehicles_nearby': float(input_dict.get('Vehicles_Nearby', 0.0)),
+            'driver_age': float(input_dict.get('Driver_Age', 40.0)),
+            'driving_experience': float(input_dict.get('Driving_Experience', 0.0)),
+            'alcohol': float(input_dict.get('Alcohol', 0.0)),
+        }
+        try:
+            vec = build_feature_vector(mapped_input)
+            baseline_risk = compute_baseline_risk(vec)
+            st.markdown(f"**Baseline (preprocessing) risk:** {baseline_risk:.2%}")
+        except Exception as e:
+            st.warning(f"Could not build weighted feature vector: {e}")
+            vec = None
+
+        # --- Optional weighted regressor prediction if available ---
+        weighted_model_path = os.path.join('models', 'accident_risk_model.joblib')
+        weighted_pred = None
+        if vec is not None and os.path.exists(weighted_model_path):
             try:
-                st.caption(f"Using model: {getattr(model_to_use, '__class__', model_to_use)}")
+                wmodel = joblib.load(weighted_model_path)
+                weighted_pred = float(wmodel.predict([vec])[0])
+                st.markdown(f"**Weighted-model predicted risk:** {weighted_pred:.2%}")
             except Exception:
-                pass
+                weighted_pred = None
 
-            st.markdown(f"**Predicted accident probability:** {prob:.2%}")
-            # --- Weighted preprocessing vector & baseline risk ---
-            mapped_input = {
-                'weather': input_dict.get('Weather'),
-                'road_type': input_dict.get('Road_Type'),
-                'time_of_day': input_dict.get('Time_of_Day'),
-                'road_condition': input_dict.get('Road_Condition') if input_dict.get('Road_Condition') != 'Icy' else 'Ice',
-                'light_condition': input_dict.get('Light_Condition') if input_dict.get('Light_Condition') != 'Dark' else 'No Street Light',
-                'traffic_density': float(input_dict.get('Traffic_Density', 0.0)),
-                'speed_limit': float(input_dict.get('Speed_Limit', 20.0)),
-                'vehicles_nearby': float(input_dict.get('Vehicles_Nearby', 0.0)),
-                'driver_age': float(input_dict.get('Driver_Age', 40.0)),
-                'driving_experience': float(input_dict.get('Driving_Experience', 0.0)),
-                'alcohol': float(input_dict.get('Alcohol', 0.0)),
-            }
-            try:
-                vec = build_feature_vector(mapped_input)
-                baseline_risk = compute_baseline_risk(vec)
-                st.markdown(f"**Baseline (preprocessing) risk:** {baseline_risk:.2%}")
-            except Exception as e:
-                st.warning(f"Could not build weighted feature vector: {e}")
-                vec = None
+        # --- Combine predictions with logic-based adjustments ---
+        try:
+            model_prob = float(prob)
+        except Exception:
+            model_prob = None
 
-            # --- Optional weighted regressor prediction if available ---
-            weighted_model_path = os.path.join('models', 'accident_risk_model.joblib')
-            weighted_pred = None
-            if vec is not None and os.path.exists(weighted_model_path):
-                try:
-                    wmodel = joblib.load(weighted_model_path)
-                    weighted_pred = float(wmodel.predict([vec])[0])
-                    st.markdown(f"**Weighted-model predicted risk:** {weighted_pred:.2%}")
-                except Exception:
-                    weighted_pred = None
-            # --- Combine predictions with logic-based adjustments ---
-            try:
-                model_prob = float(prob)
-            except Exception:
-                model_prob = None
+        sources = {}
+        if model_prob is not None:
+            sources['Model'] = model_prob
+        if 'baseline_risk' in locals() and baseline_risk is not None:
+            sources['Baseline'] = float(baseline_risk)
+        if weighted_pred is not None:
+            sources['WeightedModel'] = float(weighted_pred)
 
-            sources = {}
-            if model_prob is not None:
-                sources['Model'] = model_prob
-            if 'baseline_risk' in locals() and baseline_risk is not None:
-                sources['Baseline'] = float(baseline_risk)
-            if weighted_pred is not None:
-                sources['WeightedModel'] = float(weighted_pred)
+        # default weights (prefer model if available)
+        weights = {}
+        if 'Model' in sources:
+            weights['Model'] = 0.6
+        if 'Baseline' in sources:
+            weights['Baseline'] = 0.25
+        if 'WeightedModel' in sources:
+            weights['WeightedModel'] = 0.15
 
-            # default weights (prefer model if available)
-            weights = {}
-            if 'Model' in sources:
-                weights['Model'] = 0.6
-            if 'Baseline' in sources:
-                weights['Baseline'] = 0.25
-            if 'WeightedModel' in sources:
-                weights['WeightedModel'] = 0.15
+        # normalize weights to sum to 1
+        if sum(weights.values()) == 0 and len(sources) > 0:
+            for k in sources:
+                weights[k] = 1.0 / len(sources)
+        else:
+            s = sum(weights.values())
+            if s > 0:
+                for k in weights:
+                    weights[k] = weights[k] / s
 
-            # normalize weights to sum to 1
-            if sum(weights.values()) == 0 and len(sources) > 0:
-                for k in sources:
-                    weights[k] = 1.0 / len(sources)
-            else:
-                s = sum(weights.values())
-                if s > 0:
-                    for k in weights:
-                        weights[k] = weights[k] / s
-
-            # rule-based adjustment: small additive increases for risky conditions
+        # rule-based adjustment: small additive increases for risky conditions
+        rule_adj = 0.0
+        try:
+            ai = float(input_dict.get('Alcohol', 0))
+            if ai >= 0.5:
+                rule_adj += 0.10
+            sl = float(input_dict.get('Speed_Limit', 0))
+            if sl > 100:
+                rule_adj += 0.08
+            elif sl > 80:
+                rule_adj += 0.04
+            if input_dict.get('Road_Condition') not in (None, 'Dry'):
+                rule_adj += 0.06
+            td = float(input_dict.get('Traffic_Density', 0.0))
+            if td > 7:
+                rule_adj += 0.04
+            da = float(input_dict.get('Driver_Age', 99))
+            if da < 22:
+                rule_adj += 0.03
+            de = float(input_dict.get('Driving_Experience', 99))
+            if de < 2:
+                rule_adj += 0.03
+        except Exception:
             rule_adj = 0.0
+        rule_adj = min(rule_adj, 0.35)
+
+        # compute final risk as weighted sum + rule_adj (capped)
+        contributions = {}
+        final_risk = 0.0
+        for k, v in sources.items():
+            w = weights.get(k, 0.0)
+            contrib = float(v) * w
+            contributions[k] = {'value': float(v), 'weight': w, 'contribution': contrib}
+            final_risk += contrib
+        final_risk = float(final_risk + rule_adj)
+        final_risk = max(0.0, min(1.0, final_risk))
+
+        # display breakdown
+        try:
+            import pandas as _pd
+            br = []
+            for k, d in contributions.items():
+                br.append({'Source': k, 'Value': d['value'], 'Weight': round(d['weight'], 3), 'Contribution': round(d['contribution'], 4)})
+            br.append({'Source': 'Rule_Adjust', 'Value': round(rule_adj, 4), 'Weight': '', 'Contribution': round(rule_adj, 4)})
+            br_df = _pd.DataFrame(br).set_index('Source')
+            st.subheader('Risk calculation breakdown')
+            st.table(br_df)
+        except Exception:
+            pass
+
+        st.subheader('Final combined risk')
+        st.metric('Final predicted accident risk', f"{final_risk:.2%}")
+
+        # Predict Accident Type and Area regardless of probability if models exist
+        # Accident Type prediction: show top-3 with probabilities and a clear bar chart
+        if type_model is not None:
             try:
-                ai = float(input_dict.get('Alcohol', 0))
-                if ai >= 0.5:
-                    rule_adj += 0.10
-                sl = float(input_dict.get('Speed_Limit', 0))
-                if sl > 100:
-                    rule_adj += 0.08
-                elif sl > 80:
-                    rule_adj += 0.04
-                if input_dict.get('Road_Condition') not in (None, 'Dry'):
-                    rule_adj += 0.06
-                td = float(input_dict.get('Traffic_Density', 0.0))
-                if td > 7:
-                    rule_adj += 0.04
-                da = float(input_dict.get('Driver_Age', 99))
-                if da < 22:
-                    rule_adj += 0.03
-                de = float(input_dict.get('Driving_Experience', 99))
-                if de < 2:
-                    rule_adj += 0.03
-            except Exception:
-                rule_adj = 0.0
-            rule_adj = min(rule_adj, 0.35)
-
-            # compute final risk as weighted sum + rule_adj (capped)
-            contributions = {}
-            final_risk = 0.0
-            for k, v in sources.items():
-                w = weights.get(k, 0.0)
-                contrib = float(v) * w
-                contributions[k] = {'value': float(v), 'weight': w, 'contribution': contrib}
-                final_risk += contrib
-            final_risk = float(final_risk + rule_adj)
-            final_risk = max(0.0, min(1.0, final_risk))
-
-            # display breakdown
-            try:
-                import pandas as _pd
-                br = []
-                for k, d in contributions.items():
-                    br.append({'Source': k, 'Value': d['value'], 'Weight': round(d['weight'], 3), 'Contribution': round(d['contribution'], 4)})
-                br.append({'Source': 'Rule_Adjust', 'Value': round(rule_adj, 4), 'Weight': '', 'Contribution': round(rule_adj, 4)})
-                br_df = _pd.DataFrame(br).set_index('Source')
-                st.subheader('Risk calculation breakdown')
-                st.table(br_df)
-            except Exception:
-                pass
-
-            st.subheader('Final combined risk')
-            st.metric('Final predicted accident risk', f"{final_risk:.2%}")
-            # Predict Accident Type and Area regardless of probability if models exist
-            # Accident Type prediction: show top-3 with probabilities and a clear bar chart
-            if type_model is not None:
-                try:
-                    probs_type = type_model.predict_proba(input_df)[0]
-                    classes_type = list(type_model.classes_)
-                    # normalize/merge duplicate class labels and probs
-                    norm_labels, norm_probs = _normalize_class_probs(classes_type, probs_type)
-                    if len(norm_labels) == 0:
-                        st.markdown("**Predicted Accident Type:** Unknown")
-                    else:
-                        topk = min(3, len(norm_labels))
-                        pred_type = norm_labels[0]
-                        st.markdown(f"**Predicted Accident Type:** {pred_type}")
-                        st.write('Top predicted types:')
-                        for lab, p in zip(norm_labels[:topk], norm_probs[:topk]):
-                            st.write(f"- {lab}: {p:.1%}")
-
-                        # full probability bar chart (short labels)
-                        fig_t, ax_t = plt.subplots(figsize=(8,3))
-                        short = _shorten(norm_labels, maxlen=14)
-                        sns.barplot(x=short, y=norm_probs, palette='mako', ax=ax_t)
-                        ax_t.set_ylim(0,1)
-                        ax_t.set_ylabel('Probability')
-                        ax_t.set_title('Accident Type Probabilities')
-                        ax_t.set_xticklabels(short, rotation=45, ha='right')
-                        for i, v in enumerate(norm_probs):
-                            if v > 0:
-                                ax_t.text(i, v + 0.02, f"{v:.1%}", ha='center', fontsize=9)
-                        fig_t.tight_layout()
-                        fig_t.subplots_adjust(bottom=0.28)
-                        st.pyplot(fig_t)
-                except Exception:
-                    # fallback to direct predict
-                    try:
-                        pred_type = type_model.predict(input_df)[0]
-                        st.markdown(f"**Predicted Accident Type:** {pred_type}")
-                    except Exception:
-                        st.markdown("**Predicted Accident Type:** Unknown")
-            else:
-                # fallback: if dataset contains Accident_Type column, show most frequent types
-                if 'Accident_Type' in df.columns:
-                    counts = df['Accident_Type'].value_counts().head(5)
-                    st.markdown('**Predicted Accident Type:** Model not available — dataset frequencies:')
-                    for lab, v in counts.items():
-                        st.write(f"- {lab}: {v}")
-                    # small horizontal bar chart for frequencies
-                    fig_f, ax_f = plt.subplots(figsize=(6, max(2, len(counts)*0.4)))
-                    sns.barplot(x=counts.values, y=[str(x) for x in counts.index], palette='pastel', orient='h', ax=ax_f)
-                    ax_f.set_xlabel('Count')
-                    ax_f.set_title('Accident Type Distribution (dataset)')
-                    fig_f.tight_layout()
-                    st.pyplot(fig_f)
+                probs_type = type_model.predict_proba(input_df)[0]
+                classes_type = list(type_model.classes_)
+                # normalize/merge duplicate class labels and probs
+                norm_labels, norm_probs = _normalize_class_probs(classes_type, probs_type)
+                if len(norm_labels) == 0:
+                    st.markdown("**Predicted Accident Type:** Unknown")
                 else:
-                    st.markdown("**Predicted Accident Type:** Model not available")
+                    topk = min(3, len(norm_labels))
+                    pred_type = norm_labels[0]
+                    st.markdown(f"**Predicted Accident Type:** {pred_type}")
+                    st.write('Top predicted types:')
+                    for lab, p in zip(norm_labels[:topk], norm_probs[:topk]):
+                        st.write(f"- {lab}: {p:.1%}")
 
-            if area_model is not None:
-                try:
-                    probs_area = area_model.predict_proba(input_df)[0]
-                    classes_area = area_model.classes_
-                    top_idx = np.argmax(probs_area)
-                    pred_area = classes_area[top_idx]
-                    st.markdown(f"**Likely Area of Occurrence:** {pred_area}")
-                    fig_a, ax_a = plt.subplots(figsize=(8,3))
-                    labels_a = [str(c) for c in classes_area]
-                    short_a = _shorten(labels_a, maxlen=12)
-                    sns.barplot(x=short_a, y=probs_area, palette='viridis', ax=ax_a)
-                    ax_a.set_ylim(0,1)
-                    ax_a.set_ylabel('Probability')
-                    ax_a.set_title('Area Probabilities')
-                    ax_a.set_xticklabels(short_a, rotation=45, ha='right')
-                    for i, v in enumerate(probs_area):
+                    # full probability bar chart (short labels)
+                    fig_t, ax_t = plt.subplots(figsize=(8,3))
+                    short = _shorten(norm_labels, maxlen=14)
+                    sns.barplot(x=short, y=norm_probs, palette='mako', ax=ax_t)
+                    ax_t.set_ylim(0,1)
+                    ax_t.set_ylabel('Probability')
+                    ax_t.set_title('Accident Type Probabilities')
+                    ax_t.set_xticklabels(short, rotation=45, ha='right')
+                    for i, v in enumerate(norm_probs):
                         if v > 0:
-                            ax_a.text(i, v + 0.02, f"{v:.1%}", ha='center', fontsize=9)
-                    fig_a.tight_layout()
-                    fig_a.subplots_adjust(bottom=0.28)
-                    st.pyplot(fig_a)
+                            ax_t.text(i, v + 0.02, f"{v:.1%}", ha='center', fontsize=9)
+                    fig_t.tight_layout()
+                    fig_t.subplots_adjust(bottom=0.28)
+                    st.pyplot(fig_t)
+            except Exception:
+                # fallback to direct predict
+                try:
+                    pred_type = type_model.predict(input_df)[0]
+                    st.markdown(f"**Predicted Accident Type:** {pred_type}")
                 except Exception:
-                    pred_area = area_model.predict(input_df)[0]
-                    st.markdown(f"**Likely Area of Occurrence:** {pred_area}")
+                    st.markdown("**Predicted Accident Type:** Unknown")
+        else:
+            # fallback: if dataset contains Accident_Type column, show most frequent types
+            if 'Accident_Type' in df.columns:
+                counts = df['Accident_Type'].value_counts().head(5)
+                st.markdown('**Predicted Accident Type:** Model not available — dataset frequencies:')
+                for lab, v in counts.items():
+                    st.write(f"- {lab}: {v}")
+                # small horizontal bar chart for frequencies
+                fig_f, ax_f = plt.subplots(figsize=(6, max(2, len(counts)*0.4)))
+                sns.barplot(x=counts.values, y=[str(x) for x in counts.index], palette='pastel', orient='h', ax=ax_f)
+                ax_f.set_xlabel('Count')
+                ax_f.set_title('Accident Type Distribution (dataset)')
+                fig_f.tight_layout()
+                st.pyplot(fig_f)
             else:
-                st.markdown("**Likely Area of Occurrence:** Model not available")
+                st.markdown("**Predicted Accident Type:** Model not available")
+
+        if area_model is not None:
+            try:
+                probs_area = area_model.predict_proba(input_df)[0]
+                classes_area = area_model.classes_
+                top_idx = np.argmax(probs_area)
+                pred_area = classes_area[top_idx]
+                st.markdown(f"**Likely Area of Occurrence:** {pred_area}")
+                fig_a, ax_a = plt.subplots(figsize=(8,3))
+                labels_a = [str(c) for c in classes_area]
+                short_a = _shorten(labels_a, maxlen=12)
+                sns.barplot(x=short_a, y=probs_area, palette='viridis', ax=ax_a)
+                ax_a.set_ylim(0,1)
+                ax_a.set_ylabel('Probability')
+                ax_a.set_title('Area Probabilities')
+                ax_a.set_xticklabels(short_a, rotation=45, ha='right')
+                for i, v in enumerate(probs_area):
+                    if v > 0:
+                        ax_a.text(i, v + 0.02, f"{v:.1%}", ha='center', fontsize=9)
+                fig_a.tight_layout()
+                fig_a.subplots_adjust(bottom=0.28)
+                st.pyplot(fig_a)
+            except Exception:
+                pred_area = area_model.predict(input_df)[0]
+                st.markdown(f"**Likely Area of Occurrence:** {pred_area}")
+        else:
+            st.markdown("**Likely Area of Occurrence:** Model not available")
 
             # --- Damage prediction ---
             if damage_model is not None:
@@ -1154,14 +1217,24 @@ def build_ui(df, features, results, pipelines, type_model, area_model, damage_mo
             st.write('Not enough accident records to build monthly time series for forecasting.')
             return
 
-        months_ahead = st.slider('Months to forecast (max 120)', 12, 120, 120, 12)
+        months_ahead = st.slider('Months to forecast (max 240)', 12, 240, 120, 12)
         st.write(f'Forecasting next {months_ahead} months ({months_ahead/12:.1f} years)')
+
+        # Ensure forecasts cover through target year (2036) so end-year predictions are available
+        try:
+            last_hist_month = monthly.index.max()
+            last_hist_year = int(last_hist_month.year)
+            months_needed_to_2036 = max(0, (2036 - last_hist_year) * 12)
+        except Exception:
+            months_needed_to_2036 = 0
+
+        months_ahead_used = max(months_ahead, months_needed_to_2036)
 
         # compute forecasts per type
         forecasts = {}
         for col in monthly.columns:
             ser = monthly[col]
-            f = seasonal_trend_forecast(ser, months_ahead=months_ahead)
+            f = seasonal_trend_forecast(ser, months_ahead=months_ahead_used)
             forecasts[col] = f
         forecasts_df = pd.DataFrame(forecasts)
 
@@ -1183,6 +1256,29 @@ def build_ui(df, features, results, pipelines, type_model, area_model, damage_mo
         yearly_hist = monthly_reduced.resample('Y').sum()
         yearly_fore = forecasts_reduced.resample('Y').sum()
 
+        # Enforce non-decreasing yearly forecasts so each later year is
+        # not lower than any earlier forecasted year (prevents sudden drops
+        # at the end of the horizon shown in the UI).
+        try:
+            yearly_fore = yearly_fore.sort_index()
+            yearly_fore = yearly_fore.cummax()
+        except Exception:
+            pass
+
+        # Ensure the first forecast year (e.g., 2026) is present in yearly_fore
+        try:
+            if not forecasts_reduced.empty:
+                first_forecast_year = forecasts_reduced.index.min().year
+                if first_forecast_year not in list(yearly_fore.index.year):
+                    # sum months in forecasts_reduced that belong to that year
+                    sel = forecasts_reduced[forecasts_reduced.index.year == first_forecast_year]
+                    if sel.shape[0] > 0:
+                        add_row = sel.resample('Y').sum()
+                        # append and sort by index
+                        yearly_fore = pd.concat([yearly_fore, add_row]).sort_index()
+        except Exception:
+            pass
+
         fig_line, ax_line = plt.subplots(figsize=(10,6))
         years_hist_idx = yearly_hist.index.year
         years_fore_idx = yearly_fore.index.year
@@ -1193,20 +1289,37 @@ def build_ui(df, features, results, pipelines, type_model, area_model, damage_mo
             hist_vals = yearly_hist[col].values if col in yearly_hist.columns else np.zeros(len(years_hist_idx))
             fore_vals = yearly_fore[col].values if col in yearly_fore.columns else np.zeros(len(years_fore_idx))
             lbl = _shorten([str(col)], maxlen=18)[0]
-            ax_line.plot(years_hist_idx, hist_vals, marker='o', color=colors[i], label=f'{lbl} (hist)', linewidth=1.5)
-            # prepend the last historical point to the forecast so the dashed (pred) line
-            # connects smoothly to the historical series instead of appearing disjoint
-            if len(years_hist_idx) > 0 and len(years_fore_idx) > 0:
+
+            # Determine first forecast year (if any) and plot historical values only up to
+            # the year before the first forecast year so we don't show a small historical
+            # point that is immediately replaced by a larger forecast value.
+            if len(years_fore_idx) > 0:
+                first_fore_year = years_fore_idx[0]
+                # plot historical years strictly less than first forecast year
+                hist_mask = years_hist_idx < first_fore_year
+                if np.any(hist_mask):
+                    ax_line.plot(years_hist_idx[hist_mask], hist_vals[hist_mask], marker='o', color=colors[i], label=f'{lbl} (hist)', linewidth=1.5)
+                # plot forecast starting at the first forecast year (this will show 2026 upward)
+                if len(years_fore_idx) > 0:
+                    ax_line.plot(years_fore_idx, fore_vals, linestyle='--', marker='o', color=colors[i], label=f'{lbl} (pred)', linewidth=1.2)
+                # draw connector from last historical point to first forecast point
                 try:
-                    join_x = np.concatenate(([years_hist_idx[-1]], years_fore_idx))
-                    join_y = np.concatenate(([hist_vals[-1] if len(hist_vals) > 0 else 0], fore_vals))
+                    if np.any(hist_mask):
+                        last_hist_idx = np.where(hist_mask)[0][-1]
+                        last_hist_year = years_hist_idx[hist_mask][ -1]
+                        last_hist_val = hist_vals[hist_mask][-1]
+                    else:
+                        # fallback to last available historical
+                        last_hist_year = years_hist_idx[-1] if len(years_hist_idx) > 0 else None
+                        last_hist_val = hist_vals[-1] if len(hist_vals) > 0 else None
+                    if last_hist_year is not None and len(years_fore_idx) > 0:
+                        first_fore_val = fore_vals[0]
+                        ax_line.plot([last_hist_year, first_fore_year], [last_hist_val, first_fore_val], linestyle='--', color=colors[i], linewidth=1.2)
                 except Exception:
-                    join_x = years_fore_idx
-                    join_y = fore_vals
+                    pass
             else:
-                join_x = years_fore_idx
-                join_y = fore_vals
-            ax_line.plot(join_x, join_y, linestyle='--', marker='o', color=colors[i], label=f'{lbl} (pred)', linewidth=1.2)
+                # no forecasts available; plot full historical series
+                ax_line.plot(years_hist_idx, hist_vals, marker='o', color=colors[i], label=f'{lbl} (hist)', linewidth=1.5)
 
         ax_line.set_title('Yearly Accident Counts — Historical and Predicted')
         ax_line.set_xlabel('Year')
@@ -1215,6 +1328,125 @@ def build_ui(df, features, results, pipelines, type_model, area_model, damage_mo
         ax_line.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=9)
         fig_line.tight_layout()
         st.pyplot(fig_line)
+
+        # --- Model-based expected accidents and per-model forecasts ---
+        # For each trained classification pipeline, compute expected accidents per month
+        # by summing predicted probabilities, then forecast future months and show
+        # a yearly historical+predicted plot per model.
+        model_names_to_show = ['RandomForest', 'LogisticRegression', 'XGBoost', 'SVM', 'NaiveBayes']
+
+        # build a dataframe with period aligned to monthly index (same logic as build_monthly_ts)
+        dc = _detect_date_col(df)
+        df_copy = df.copy()
+        if isinstance(dc, tuple):
+            df_copy['date'] = pd.to_datetime(df_copy['Year'].astype(str) + '-' + df_copy['Month'].astype(str) + '-01')
+        elif dc is not None:
+            df_copy['date'] = pd.to_datetime(df_copy[dc], errors='coerce')
+        else:
+            n = df_copy.shape[0]
+            end = pd.Timestamp.today()
+            start = end - pd.DateOffset(years=5)
+            dates = pd.date_range(start=start, end=end, periods=n)
+            df_copy['date'] = dates
+        df_copy = df_copy.dropna(subset=['date'])
+        df_copy['period'] = df_copy['date'].dt.to_period('M').dt.to_timestamp()
+
+        # First, compute monthly expected accidents for each model and store them
+        monthly_expected_by_model = {}
+        for model_name in model_names_to_show:
+            if model_name not in pipelines:
+                continue
+            mdl = pipelines[model_name]
+            prob_col = f'pred_prob_{model_name}'
+            try:
+                X_all = df_copy[features]
+                if hasattr(mdl, 'predict_proba'):
+                    probs = mdl.predict_proba(X_all)
+                    if probs.ndim == 2 and probs.shape[1] > 1:
+                        probs = probs[:, 1]
+                    else:
+                        probs = probs.ravel()
+                else:
+                    preds = mdl.predict(X_all)
+                    probs = np.array(preds, dtype=float)
+            except Exception:
+                continue
+
+            # sum predicted probabilities per month -> expected accidents per month
+            df_tmp = df_copy.copy()
+            df_tmp[prob_col] = probs
+            monthly_expected = df_tmp.groupby('period')[prob_col].sum()
+            if monthly_expected.shape[0] == 0:
+                continue
+            monthly_expected_by_model[model_name] = monthly_expected
+
+        if len(monthly_expected_by_model) == 0:
+            # no model series to show
+            pass
+        else:
+            # compute overall mean expected to derive deterministic model-specific scaling
+            means = {k: v.mean() for k, v in monthly_expected_by_model.items()}
+            overall_mean = float(np.mean(list(means.values()))) if len(means) > 0 else 0.0
+
+            for model_name, monthly_expected in monthly_expected_by_model.items():
+                # model-specific factor: relative to overall mean, small bounded adjustment
+                mmean = float(means.get(model_name, 0.0))
+                if overall_mean > 0:
+                    rel = (mmean - overall_mean) / (overall_mean)
+                else:
+                    rel = 0.0
+                model_factor = 1.0 + 0.2 * float(rel)
+                model_factor = max(0.7, min(1.3, model_factor))
+
+                # forecast monthly expected using seasonal_trend_forecast, then scale
+                f_series = seasonal_trend_forecast(monthly_expected, months_ahead=months_ahead)
+                f_series = f_series * model_factor
+
+                yearly_hist_m = monthly_expected.resample('Y').sum()
+                yearly_fore_m = f_series.resample('Y').sum()
+
+                # enforce non-decreasing yearly forecast to match requirement "accident from each year needed to get higher"
+                try:
+                    yearly_fore_m = yearly_fore_m.cummax()
+                except Exception:
+                    pass
+
+                fig_m, ax_m = plt.subplots(figsize=(10,6))
+                years_hist_idx = yearly_hist_m.index.year
+                years_fore_idx = yearly_fore_m.index.year
+
+                hist_vals = yearly_hist_m.values if len(yearly_hist_m) > 0 else np.zeros(0)
+                fore_vals = yearly_fore_m.values if len(yearly_fore_m) > 0 else np.zeros(0)
+
+                # Plot historical years only up to the year before the first forecast year
+                if len(years_fore_idx) > 0:
+                    first_fy = years_fore_idx[0]
+                    hist_mask_m = years_hist_idx < first_fy
+                    if np.any(hist_mask_m):
+                        ax_m.plot(years_hist_idx[hist_mask_m], hist_vals[hist_mask_m], marker='o', color='C0', label=f'{model_name} (hist)', linewidth=1.5)
+                    # plot forecast values starting at the first forecast year
+                    ax_m.plot(years_fore_idx, fore_vals, linestyle='--', marker='o', color='C0', label=f'{model_name} (pred)', linewidth=1.2)
+                    # connector from last historical to first forecast
+                    try:
+                        if np.any(hist_mask_m):
+                            last_hist_val_m = hist_vals[hist_mask_m][-1]
+                            last_hist_year_m = years_hist_idx[hist_mask_m][-1]
+                        else:
+                            last_hist_year_m = years_hist_idx[-1] if len(years_hist_idx) > 0 else None
+                            last_hist_val_m = hist_vals[-1] if len(hist_vals) > 0 else None
+                        if last_hist_year_m is not None and len(years_fore_idx) > 0:
+                            first_fore_val_m = fore_vals[0]
+                            ax_m.plot([last_hist_year_m, first_fy], [last_hist_val_m, first_fore_val_m], linestyle='--', color='C0', linewidth=1.2)
+                    except Exception:
+                        pass
+                else:
+                    ax_m.plot(years_hist_idx, hist_vals, marker='o', color='C0', label=f'{model_name} (hist)', linewidth=1.5)
+                ax_m.set_title(f'Yearly Accident Counts — Historical and Predicted ({model_name})')
+                ax_m.set_xlabel('Year')
+                ax_m.set_ylabel('Predicted accidents')
+                ax_m.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=9)
+                fig_m.tight_layout()
+                st.pyplot(fig_m)
 
         # Bar chart: actual (historical total) vs estimated (first forecast year)
         actual_totals = monthly.sum()
